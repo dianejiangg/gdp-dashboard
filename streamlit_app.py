@@ -1,151 +1,213 @@
 import streamlit as st
 import pandas as pd
-import math
-from pathlib import Path
+import plotly.express as px
+import plotly.graph_objects as go
+import requests
+from datetime import datetime, timedelta
+import time
+import numpy as np
 
-# Set the title and favicon that appear in the Browser's tab bar.
+# Set page config
 st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
+    page_title="Earthquake Monitor",
+    page_icon="🌍",
+    layout="wide"
 )
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# Function to fetch earthquake data
+def fetch_earthquake_data():
+    url = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_week.geojson"
+    response = requests.get(url)
+    data = response.json()
+    
+    # Convert to DataFrame
+    earthquakes = []
+    for feature in data['features']:
+        earthquakes.append({
+            'time': datetime.fromtimestamp(feature['properties']['time']/1000.0),
+            'magnitude': feature['properties']['mag'],
+            'place': feature['properties']['place'],
+            'depth': feature['geometry']['coordinates'][2],
+            'latitude': feature['geometry']['coordinates'][1],
+            'longitude': feature['geometry']['coordinates'][0]
+        })
+    
+    return pd.DataFrame(earthquakes)
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+# App title
+st.title('Real-time Earthquake Monitor')
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
+# Load data
+df = fetch_earthquake_data()
+
+# Add time filter
+time_filter = st.sidebar.selectbox(
+    'Select Time Range',
+    ['Last 24 Hours', 'Last 48 Hours', 'Last 7 Days']
+)
+
+# Filter data based on selection
+now = pd.Timestamp.now()
+if time_filter == 'Last 24 Hours':
+    df = df[df['time'] > (now - pd.Timedelta(hours=24))]
+elif time_filter == 'Last 48 Hours':
+    df = df[df['time'] > (now - pd.Timedelta(hours=48))]
+
+# Display key metrics
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.metric("Total Earthquakes", len(df))
+with col2:
+    st.metric("Average Magnitude", f"{df['magnitude'].mean():.2f}")
+with col3:
+    st.metric("Maximum Magnitude", f"{df['magnitude'].max():.2f}")
+with col4:
+    st.metric("Significant Events (M5.0+)", len(df[df['magnitude'] >= 5.0]))
+
+# Create marker sizes for map (handling negative magnitudes)
+df['marker_size'] = np.where(df['magnitude'] > 0, 
+                            df['magnitude'] * 5,  # Multiply by 5 to make markers more visible
+                            1)  # Default size for negative/zero magnitudes
+
+# Create visualizations
+st.subheader("Earthquake Locations")
+fig = px.scatter_mapbox(df, 
+    lat='latitude', 
+    lon='longitude',
+    size='marker_size',
+    color='magnitude',
+    hover_name='place',
+    hover_data=['magnitude', 'depth', 'time'],
+    zoom=1,
+    mapbox_style='carto-positron')
+
+# Adjust marker appearance
+fig.update_traces(marker={'sizemin': 3})
+
+st.plotly_chart(fig, use_container_width=True)
+
+# Magnitude distribution
+st.subheader("Magnitude Distribution")
+fig_mag = px.histogram(df, 
+                      x='magnitude', 
+                      nbins=30,
+                      title='Distribution of Earthquake Magnitudes')
+fig_mag.update_layout(
+    xaxis_title="Magnitude",
+    yaxis_title="Count"
+)
+st.plotly_chart(fig_mag, use_container_width=True)
+
+# Depth vs Magnitude scatter plot
+st.subheader("Depth vs Magnitude")
+fig_depth = px.scatter(df, 
+                      x='depth', 
+                      y='magnitude',
+                      title='Earthquake Depth vs Magnitude',
+                      color='magnitude',
+                      size='marker_size')
+fig_depth.update_layout(
+    xaxis_title="Depth (km)",
+    yaxis_title="Magnitude"
+)
+st.plotly_chart(fig_depth, use_container_width=True)
+
+# Recent events table
+st.subheader("Recent Events")
+recent_df = df.copy()
+recent_df['time'] = recent_df['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+st.dataframe(
+    recent_df.sort_values('time', ascending=False)
+    .head(10)
+    [['time', 'place', 'magnitude', 'depth']]
+    .reset_index(drop=True)
+    .style.format({
+        'magnitude': '{:.1f}',
+        'depth': '{:.1f} km'
+    })
+)
+
+# Temporal Visualizations
+st.header("Temporal Analysis")
+
+# 1. Events Over Time
+df['hour'] = df['time'].dt.hour
+hourly_counts = df.groupby('hour').size().reset_index(name='count')
+fig_hourly = px.line(hourly_counts, 
+                     x='hour', 
+                     y='count',
+                     title='Earthquake Events by Hour of Day',
+                     markers=True)
+fig_hourly.update_layout(
+    xaxis_title="Hour of Day",
+    yaxis_title="Number of Events"
+)
+st.plotly_chart(fig_hourly, use_container_width=True)
+
+# 2. Magnitude Timeline
+fig_timeline = px.scatter(df.sort_values('time'), 
+                         x='time', 
+                         y='magnitude',
+                         color='magnitude',
+                         size='marker_size',
+                         title='Earthquake Magnitudes Over Time')
+fig_timeline.update_layout(
+    xaxis_title="Time",
+    yaxis_title="Magnitude"
+)
+st.plotly_chart(fig_timeline, use_container_width=True)
+
+# 3. Rolling Average of Events
+# Calculate events per hour with 6-hour rolling average
+df['hour_bin'] = df['time'].dt.floor('H')
+hourly_series = df.groupby('hour_bin').size()
+hourly_series = hourly_series.reindex(
+    pd.date_range(start=hourly_series.index.min(),
+                 end=hourly_series.index.max(),
+                 freq='H'),
+    fill_value=0
+)
+rolling_avg = hourly_series.rolling(window=6).mean()
+
+fig_rolling = go.Figure()
+fig_rolling.add_trace(go.Scatter(
+    x=rolling_avg.index,
+    y=rolling_avg.values,
+    mode='lines',
+    name='6-hour Rolling Average'
+))
+fig_rolling.update_layout(
+    title='6-Hour Rolling Average of Earthquake Frequency',
+    xaxis_title="Time",
+    yaxis_title="Average Number of Events per Hour"
+)
+st.plotly_chart(fig_rolling, use_container_width=True)
+
+# 4. Heatmap of Events by Hour and Magnitude
+df['magnitude_bin'] = pd.cut(df['magnitude'], 
+                           bins=np.arange(-1, 8, 1),
+                           labels=[f"{i}-{i+1}" for i in range(-1, 7)])
+heatmap_data = pd.crosstab(df['hour'], df['magnitude_bin'])
+
+fig_heatmap = px.imshow(heatmap_data,
+                        title='Heatmap of Events by Hour and Magnitude',
+                        labels=dict(x="Magnitude Range", y="Hour of Day", color="Number of Events"),
+                        aspect='auto')
+st.plotly_chart(fig_heatmap, use_container_width=True)
+
+# Add refresh button
+if st.button('Refresh Data'):
+    st.experimental_rerun()
+
+# Optional: Add auto-refresh using JavaScript
+st.markdown(
     """
-
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
-
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
-
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
-
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
-
-    return gdp_df
-
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
+    <script>
+        function reload() {
+            window.location.reload();
+        }
+        setTimeout(reload, 300000); // Refresh every 5 minutes
+    </script>
+    """,
+    unsafe_allow_html=True
 )
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
